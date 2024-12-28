@@ -733,6 +733,76 @@ class WriteUsbHidApi(WriteMethod):
             WriteUsbHidApi.pyhidapi.hid_write(self.dev, sendbuf)
 
 
+class WriteSerialApi(WriteMethod):
+    """Write to a device with the open-source firmware via the USB serial port using pyusb.
+    """
+    _module_loaded = False
+    try:
+        import serial
+        _module_loaded = True
+        print("Module pyserial detected")
+    except:
+        pass
+
+    def __init__(self):
+        WriteMethod.__init__(self)
+        self.description = None
+        self.path = None
+        self.dev = None
+
+    def get_name(self):
+        return 'pyserial'
+
+    def get_description(self):
+        return 'Program a device with the open-source firmware, connected via USB, using the pyserial package.'
+
+    def _open(self, device_id):
+        import serial
+        self.description = self.devices[device_id][0]
+        self.path = self.devices[device_id][1]
+        self.dev = serial.Serial(self.path)
+        if self.dev:
+            print("Pyserial device initialized")
+
+        return self.dev is not None
+
+    def close(self):
+        if self.dev is not None:
+            self.dev.close()
+        self.description = None
+        self.path = None
+        self.dev = None
+
+    def _get_available_devices(self):
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+
+        devices = {}
+        for port, desc, hwid in ports:
+            if desc == "n/a": 
+                continue
+            devices[port] = (f"{desc} ({hwid})", port)
+        return devices
+
+    def is_ready(self):
+        return WriteSerialApi._module_loaded
+
+    def has_device(self):
+        return self.dev is not None
+
+    def _write(self, buf):
+        if not self.dev:
+            return
+
+        print("Write using [%s] via pyserial" % (self.description,))
+        for i in range(int(len(buf) / 64)):
+            # sendbuf must contain "report ID" as first byte. "0" does the job here.
+            sendbuf = array('B', [0])
+            # Then, put the 64 payload bytes into the buffer
+            sendbuf.extend(buf[i * 64:i * 64 + 64])
+            self.dev.write(buf)
+
+
 class LedNameBadge:
     _protocol_header_template = (
         0x77, 0x61, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
@@ -945,7 +1015,7 @@ class LedNameBadge:
 
     @staticmethod
     def _get_auto_order_method_list():
-        return [WriteUsbHidApi(), WriteLibUsb()]
+        return [WriteUsbHidApi(), WriteLibUsb(), WriteSerialApi()]
 
     @staticmethod
     def _print_available_methods(methods):
@@ -1122,6 +1192,9 @@ def main():
 
     for msg_bitmap in msg_bitmaps:
         buf.extend(msg_bitmap[0])
+
+    with open("bitmap.bin", "wb") as f:
+        f.write(buf)
 
     # Translate -H to -M parameter
     method = args.method

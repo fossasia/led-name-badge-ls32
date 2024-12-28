@@ -11,6 +11,7 @@ class Test(abstract_write_method_test.AbstractWriteMethodTest):
         self.assertIn("'auto'", output)
         self.assertIn("'hidapi'", output)
         self.assertIn("'libusb'", output)
+        self.assertIn("'pyserial'", output)
 
         method, output = self.call_find(True, True, True, 'hidapi', 'list')
         self.assertIn("Known device ids with method 'hidapi' are:", output)
