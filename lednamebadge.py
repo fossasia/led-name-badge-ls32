@@ -733,7 +733,7 @@ class WriteUsbHidApi(WriteMethod):
             WriteUsbHidApi.pyhidapi.hid_write(self.dev, sendbuf)
 
 
-class WriteSerialApi(WriteMethod):
+class WriteSerial(WriteMethod):
     """Write to a device with the open-source firmware via the USB serial port using pyserial.
     """
     _module_loaded = False
@@ -785,7 +785,7 @@ class WriteSerialApi(WriteMethod):
         return devices
 
     def is_ready(self):
-        return WriteSerialApi._module_loaded
+        return WriteSerial._module_loaded
 
     def has_device(self):
         return self.dev is not None
@@ -1015,7 +1015,7 @@ class LedNameBadge:
 
     @staticmethod
     def _get_auto_order_method_list():
-        return [WriteUsbHidApi(), WriteLibUsb(), WriteSerialApi()]
+        return [WriteUsbHidApi(), WriteLibUsb(), WriteSerial()]
 
     @staticmethod
     def _print_available_methods(methods):
