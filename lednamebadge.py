@@ -795,12 +795,7 @@ class WriteSerial(WriteMethod):
             return
 
         print("Write using [%s] via pyserial" % (self.description,))
-        for i in range(int(len(buf) / 64)):
-            # sendbuf must contain "report ID" as first byte. "0" does the job here.
-            sendbuf = array('B', [0])
-            # Then, put the 64 payload bytes into the buffer
-            sendbuf.extend(buf[i * 64:i * 64 + 64])
-            self.dev.write(buf)
+        self.dev.write(buf)
 
 
 class LedNameBadge:
@@ -1192,9 +1187,6 @@ def main():
 
     for msg_bitmap in msg_bitmaps:
         buf.extend(msg_bitmap[0])
-
-    with open("bitmap.bin", "wb") as f:
-        f.write(buf)
 
     # Translate -H to -M parameter
     method = args.method
