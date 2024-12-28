@@ -734,7 +734,7 @@ class WriteUsbHidApi(WriteMethod):
 
 
 class WriteSerialApi(WriteMethod):
-    """Write to a device with the open-source firmware via the USB serial port using pyusb.
+    """Write to a device with the open-source firmware via the USB serial port using pyserial.
     """
     _module_loaded = False
     try:
