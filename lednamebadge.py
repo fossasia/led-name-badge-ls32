@@ -292,7 +292,7 @@ class SimpleTextAndIcons:
             0b10011001,  # 0x99
             0b01000010,  # 0x42
             0b00111100,  # 0x3c
-            0b00000000  # 0x00
+            0b00000000,  # 0x00
         )), 1, '\x1d'),
         'happy2':    (array('B', (0x00, 0x08, 0x14, 0x08, 0x01, 0x00, 0x00, 0x61, 0x30, 0x1c, 0x07,
                                   0x00, 0x20, 0x50, 0x20, 0x00, 0x80, 0x80, 0x86, 0x0c, 0x38, 0xe0)), 2, '\x1c'),
@@ -401,7 +401,7 @@ class SimpleTextAndIcons:
         if im.height != 11:
             sys.exit("%s: image height must be 11px. Seen %d" % (file, im.height))
         buf = array('B')
-        cols = int((im.width + 7) / 8)
+        cols = (im.width + 7) // 8
         for col in range(cols):
             for row in range(11):  # [0..10]
                 byte_val = 0
@@ -411,7 +411,7 @@ class SimpleTextAndIcons:
                     if x < im.width and row < im.height:
                         pixel_color = im.getpixel((x, row))
                         if isinstance(pixel_color, tuple):
-                            monochrome_color = sum(pixel_color[:3]) / len(pixel_color[:3])
+                            monochrome_color = sum(pixel_color[:3]) // len(pixel_color[:3])
                         elif isinstance(pixel_color, int):
                             monochrome_color = pixel_color
                         else:
@@ -580,7 +580,8 @@ class WriteLibUsb(WriteMethod):
         WriteMethod.__init__(self)
         self.description = None
         self.dev = None
-        self.endpoint = None
+        self.endpoint_out = None
+        self.endpoint_in = None
 
     def get_name(self):
         return 'libusb'
@@ -591,7 +592,8 @@ class WriteLibUsb(WriteMethod):
     def _open(self, device_id):
         self.description = self.devices[device_id][0]
         self.dev = self.devices[device_id][1]
-        self.endpoint = self.devices[device_id][2]
+        self.endpoint_out = self.devices[device_id][2]
+        self.endpoint_in = self.devices[device_id][3]
         print("Libusb device initialized")
         return True
 
@@ -601,7 +603,8 @@ class WriteLibUsb(WriteMethod):
             WriteLibUsb.usb.util.dispose_resources(self.dev)
         self.description = None
         self.dev = None
-        self.endpoint = None
+        self.endpoint_out = None
+        self.endpoint_in = None
 
     def _get_available_devices(self):
         devs = WriteLibUsb.usb.core.find(idVendor=0x0416, idProduct=0x5020, find_all=True)
@@ -625,12 +628,20 @@ class WriteLibUsb(WriteMethod):
             eps = WriteLibUsb.usb.util.find_descriptor(
                 cfg,
                 find_all=True,
-                custom_match=lambda e: WriteLibUsb.usb.util.endpoint_direction(e.bEndpointAddress) == WriteLibUsb.usb.util.ENDPOINT_OUT)
+            )
+            ep_in = None
+            ep_out = None
             for ep in eps:
-                did = "%d:%d:%d" % (d.bus, d.address, ep.bEndpointAddress)
-                descr = ("%s - %s (bus=%d dev=%d endpoint=%d)" %
-                         (d.manufacturer, d.product, d.bus, d.address, ep.bEndpointAddress))
-                devices[did] = (descr, d, ep)
+                if WriteLibUsb.usb.util.endpoint_direction(ep.bEndpointAddress) == WriteLibUsb.usb.util.ENDPOINT_OUT:
+                    ep_out = ep
+                if WriteLibUsb.usb.util.endpoint_direction(ep.bEndpointAddress) == WriteLibUsb.usb.util.ENDPOINT_IN:
+                    ep_in = ep
+            assert ep_in and ep_out
+
+            did = "%d:%d:%d:%d" % (d.bus, d.address, ep_out.bEndpointAddress, ep_in.bEndpointAddress)
+            descr = ("%s - %s (bus=%d dev=%d endpoint_out=%d endpoint_in=%d)" %
+                        (d.manufacturer, d.product, d.bus, d.address, ep_out.bEndpointAddress, ep_in.bEndpointAddress))
+            devices[did] = (descr, d, ep_out, ep_in)
         return devices
 
     def is_ready(self):
@@ -661,7 +672,8 @@ class WriteLibUsb(WriteMethod):
         print("Write using %s via libusb" % (self.description,))
         for i in range(int(len(buf) / 64)):
             time.sleep(0.1)
-            self.endpoint.write(buf[i * 64:i * 64 + 64])
+            self.endpoint_out.write(buf[i * 64:i * 64 + 64])
+            self.endpoint_in.read(64)
 
 
 class WriteUsbHidApi(WriteMethod):
@@ -779,7 +791,7 @@ class WriteSerial(WriteMethod):
 
         devices = {}
         for port, desc, hwid in ports:
-            if desc == "n/a": 
+            if desc == "n/a":
                 continue
             devices[port] = (f"{desc} ({hwid})", port)
         return devices
@@ -1129,20 +1141,20 @@ def main():
     parser.add_argument('message', metavar='MESSAGE', nargs='+',
                         help="Up to 8 message texts with embedded builtin icons or loaded images within colons(:) -- See -l for a list of builtins.")
     parser.add_argument('--mode-help', action='version', help=argparse.SUPPRESS, version="""
-    
+
     -m 5 "Animation"
-    
+
      Animation frames are 6 character (or 48px) wide. Upload an animation of
      N frames as one image N*48 pixels wide, 11 pixels high.
      Frames run from left to right and repeat endless.
      Speeds [1..8] result in ca. [1.2 1.3 2.0 2.4 2.8 4.5 7.5 15] fps.
-    
+
      Example of a slowly beating heart:
       sudo %s -s1 -m5 "  :heart2:    :HEART2:"
-    
+
     -m 9 "Smooth"
     -m 10 "Rotate"
-    
+
      These modes are mentioned in the BMP Badge software.
      Text is shown static, or sometimes (longer texts?) not shown at all.
      One significant difference is: The text of the first message stays visible after
