@@ -305,6 +305,12 @@ write method. Also, they can change between computer startups or reconnects.
 See the gfx/starfield folder for examples. An animation of N frames is provided as an image N*48 pixels wide,
 for both 48 and 44 pixel wide devices.
 
+#### Tetris
+
+Contributed animation gfx/tetris.png was created as animated GIF in <https://www.piskelapp.com> and converted to compatible PNG using ffmpeg `tile` filter. (Original GIF and transformation commands were lost to time.)
+
+![Tetris on the badge](photos/tetris-on-badge.gif)
+
 ## Usage as module
 
 ### Writing to the device
