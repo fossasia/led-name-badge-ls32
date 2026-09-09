@@ -212,6 +212,8 @@ plays a doom game video.
 prints the list of builtin icon names, including :happy: :happy2: :heart: :HEART: :heart2: :HEART2: :fablab: :bicycle: :
 bicycle_r: :owncloud: ::
 
+Literal colons in text (such as clock strings like `"23:18:35"` or timestamps) pass through cleanly as literal text unless matching a valid icon or preloaded image. Colons can also be explicitly escaped using `::`.
+
     python ./led-badge-11x44.py --help
 
 lists all write methods. Does not write anything to the device.
