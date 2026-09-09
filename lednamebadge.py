@@ -380,10 +380,7 @@ class SimpleTextAndIcons:
                     return chr(idx)
                 return m.group(0)
             if '.' in name:
-                if os.path.exists(name):
-                    self.bitmap_preloaded.append(SimpleTextAndIcons.bitmap_img(name))
-                    return chr(len(self.bitmap_preloaded) - 1)
-                if any(name.lower().endswith(ext) for ext in ('.png', '.bmp', '.jpg', '.jpeg', '.gif')):
+                if os.path.isfile(name):
                     self.bitmap_preloaded.append(SimpleTextAndIcons.bitmap_img(name))
                     return chr(len(self.bitmap_preloaded) - 1)
                 return m.group(0)

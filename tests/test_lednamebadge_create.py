@@ -49,6 +49,7 @@ class Test(TestCase):
             ('Ratio 1:2:3', 11),
             ('Notice: test: message', 21),
             (':unknown_icon:', 14),
+            (':missing.png:', 13),
         ]
         for text, expected_cols in test_cases:
             buf, cols = creator.bitmap(text)
