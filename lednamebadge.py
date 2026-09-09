@@ -345,8 +345,13 @@ class SimpleTextAndIcons:
             if ch in SimpleTextAndIcons.bitmap_builtin:
                 return SimpleTextAndIcons.bitmap_builtin[ch][:2]
 
-            self.bitmaps_preloaded_unused = False
-            return self.bitmap_preloaded[ord(ch)]
+            if 0 < ord(ch) < len(self.bitmap_preloaded):
+                self.bitmaps_preloaded_unused = False
+                return self.bitmap_preloaded[ord(ch)]
+
+            raise IndexError(
+                "no preloaded image #%d; escape colons as '::' if you meant literal text" % ord(ch)
+            )
 
         o = SimpleTextAndIcons.char_offsets[ch]
         return SimpleTextAndIcons.font_11x44[o:o + 11], 1
@@ -359,18 +364,27 @@ class SimpleTextAndIcons:
           ":happy:" is replaced with a reference to a builtin smiley glyph
           ":heart:" is replaced with a reference to a builtin heart glyph
           ":gfx/logo.png:" preloads the file gfx/logo.png and is replaced the corresponding control char.
+          Numeric references :N: only substitute when an image N is actually preloaded.
+          Other text between colons (e.g. clock strings like "23:18:35") passes through as literal text.
         """
 
         def replace_symbolic(m):
             name = m.group(1)
             if name == '':
                 return ':'
-            if re.match('^[0-9]*$', name):  # py3 name.isdecimal()
-                return chr(int(name))
+            if name in SimpleTextAndIcons.bitmap_named:
+                return SimpleTextAndIcons.bitmap_named[name][2]
+            if re.match('^[0-9]+$', name):  # py3 name.isdecimal()
+                idx = int(name)
+                if 0 < idx < len(self.bitmap_preloaded):
+                    return chr(idx)
+                return m.group(0)
             if '.' in name:
-                self.bitmap_preloaded.append(SimpleTextAndIcons.bitmap_img(name))
-                return chr(len(self.bitmap_preloaded) - 1)
-            return SimpleTextAndIcons.bitmap_named[name][2]
+                if os.path.isfile(name):
+                    self.bitmap_preloaded.append(SimpleTextAndIcons.bitmap_img(name))
+                    return chr(len(self.bitmap_preloaded) - 1)
+                return m.group(0)
+            return m.group(0)
 
         text = re.sub(r':([^:]*):', replace_symbolic, text)
         buf = array('B')
@@ -426,6 +440,9 @@ class SimpleTextAndIcons:
     def bitmap(self, arg):
         """If arg is a valid and existing path name, we load it as an image.
             Otherwise, we take it as a string (with ":"-notation, see bitmap_text()).
+            Note: Literal colons in text (such as clock strings "23:18:35") pass
+            through unchanged unless matching a valid icon or preloaded image.
+            Colons can also be explicitly escaped as "::".
         """
         if os.path.exists(arg):
             return SimpleTextAndIcons.bitmap_img(arg)
