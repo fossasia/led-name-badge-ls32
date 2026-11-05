@@ -664,13 +664,37 @@ class WriteLibUsb(WriteMethod):
             self.endpoint.write(buf[i * 64:i * 64 + 64])
 
 
+def _hidapi_compat():
+    """Provide the pyhidapi functions used here on top of the 'hid' module
+    from the maintained 'hidapi' package (pip install hidapi), because
+    pyhidapi no longer installs on recent macOS / Python versions."""
+    import hid
+    from types import SimpleNamespace
+
+    def hid_open_path(path):
+        dev = hid.device()
+        dev.open_path(path)
+        return dev
+
+    return SimpleNamespace(
+        hid_init=lambda: None,
+        hid_enumerate=lambda vid=0, pid=0: [SimpleNamespace(**d) for d in hid.enumerate(vid, pid)],
+        hid_open_path=hid_open_path,
+        hid_write=lambda dev, data: dev.write(bytes(data)),
+        hid_close=lambda dev: dev.close(),
+    )
+
+
 class WriteUsbHidApi(WriteMethod):
     """Write to a device connected to USB using pyhidapi and libhidapi. The device ids are simply the device paths as
     used by libhidapi.
     """
     _module_loaded = False
     try:
-        import pyhidapi
+        try:
+            import pyhidapi
+        except ImportError:
+            pyhidapi = _hidapi_compat()
         pyhidapi.hid_init()
         _module_loaded = True
         print("Module pyhidapi detected")
