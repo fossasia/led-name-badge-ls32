@@ -85,8 +85,14 @@
 #     * Preparation for further or updated write methods, like bluetooth.
 #     * Automatic or manual write method and device selection, See -M and -D (substituting -H) resp.
 #       get_available_methods() and get_available_device_ids().
-# v0.15, 2025-09-15,  detection is now fully automatic.
-#     * Supporting only static text and bitmap for now
+# v0.15, 2025-09-15, sv support for a second badge type (vendorID 0x204c, productID 0x4359, GD32F150)
+#     with a completely different, reverse engineered protocol. Only static text / bitmap is supported.
+#     * Header generation is abstracted into two concrete classes, Ls32HeaderGenerator and
+#       CustomHeaderGenerator. Each write method is bound to one of them and knows the vendorID /
+#       productID of its device(s), so no device or protocol decision is threaded through the
+#       write methods any more. The new badge gets its own write methods, 'hidapi-custom' and
+#       'libusb-custom'.
+
 
 import argparse
 import os
@@ -433,16 +439,247 @@ class SimpleTextAndIcons:
         return self.bitmap_text(arg)
 
 
+class HeaderGenerator:
+    """Base class for a header generator. A header generator knows the wire protocol of one badge type:
+    it turns the message bitmaps (as created by SimpleTextAndIcons) plus the display options into the
+    sequence of buffers that has to be written to the device, in order. The first buffer(s) contain the
+    protocol header(s) of the device.
+
+    Each concrete write method is bound to exactly one concrete header generator (see WriteMethod),
+    so the rest of the program never has to distinguish between badge types.
+    """
+
+    def create_buffers(self, msg_bitmaps, speeds, modes, blinks, ants, brightness):
+        """Returns the buffers to write to the device, in the order they have to be written.
+        This method is to be implemented in your concrete class.
+        """
+        raise NotImplementedError()
+
+
+class Ls32HeaderGenerator(HeaderGenerator):
+    """Header generator for the original LS32 badge (vendorID 0x0416, productID 0x5020).
+    Its protocol consists of one single buffer: a 64 byte header, followed by the bitmap data.
+    """
+
+    _protocol_header_template = (
+        0x77, 0x61, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    )
+
+    @staticmethod
+    def header(lengths, speeds, modes, blinks, ants, brightness=100, date=datetime.now()):
+        """Create a protocol header
+            * length, speeds, modes, blinks, ants are iterables with at least one element
+            * lengths[0] is the number of chars/byte-columns of the first text/bitmap, lengths[1] of the second,
+              and so on...
+            * len(length) should match the designated bitmap data
+            * speeds come in as 1..8, but will be decremented to 0..7, here.
+            * modes: 0..8
+            * blinks and ants: 0..1 or even False...True,
+            * brightness, if given, is any number, but it'll be limited to 25, 50, 75, 100 (percent), here
+            * date, if given, is a datetime object. It will be written in the header, but is not to be seen on the
+              devices screen.
+        """
+        try:
+            lengths_sum = sum(lengths)
+        except:
+            raise TypeError("Please give a list or tuple with at least one number: " + str(lengths))
+        if lengths_sum > (8192 - len(Ls32HeaderGenerator._protocol_header_template)) / 11 + 1:
+            raise ValueError("The given lengths seem to be far too high: " + str(lengths))
+
+        ants = Ls32HeaderGenerator._prepare_iterable(ants, 0, 1)
+        blinks = Ls32HeaderGenerator._prepare_iterable(blinks, 0, 1)
+        speeds = Ls32HeaderGenerator._prepare_iterable(speeds, 1, 8)
+        modes = Ls32HeaderGenerator._prepare_iterable(modes, 0, 8)
+
+        speeds = [x - 1 for x in speeds]
+
+        h = list(Ls32HeaderGenerator._protocol_header_template)
+
+        if brightness <= 25:
+            h[5] = 0x40
+        elif brightness <= 50:
+            h[5] = 0x20
+        elif brightness <= 75:
+            h[5] = 0x10
+        # else default 100% == 0x00
+
+        for i in range(8):
+            h[6] += blinks[i] << i
+            h[7] += ants[i] << i
+
+        for i in range(8):
+            h[8 + i] = 16 * speeds[i] + modes[i]
+
+        for i in range(len(lengths)):
+            h[17 + (2 * i) - 1] = lengths[i] // 256
+            h[17 + (2 * i)] = lengths[i] % 256
+
+        try:
+            h[38 + 0] = date.year % 100
+            h[38 + 1] = date.month
+            h[38 + 2] = date.day
+            h[38 + 3] = date.hour
+            h[38 + 4] = date.minute
+            h[38 + 5] = date.second
+        except:
+            raise TypeError("Please give a datetime object: " + str(date))
+
+        return h
+
+    @staticmethod
+    def _prepare_iterable(iterable, min_, max_):
+        try:
+            iterable = [min(max(x, min_), max_) for x in iterable]
+            iterable = tuple(iterable) + (iterable[-1],) * (8 - len(iterable))  # repeat last element
+            return iterable
+        except:
+            raise TypeError("Please give a list or tuple with at least one number: " + str(iterable))
+
+    def create_buffers(self, msg_bitmaps, speeds, modes, blinks, ants, brightness):
+        buf = array('B')
+        buf.extend(self.header([b[1] for b in msg_bitmaps], speeds, modes, blinks, ants, brightness))
+        for msg_bitmap in msg_bitmaps:
+            buf.extend(msg_bitmap[0])
+        return [buf]
+
+
+class CustomHeaderGenerator(HeaderGenerator):
+    """Header generator for the badge with vendorID 0x204c and productID 0x4359 (GD32F150 controller).
+    Its protocol is significantly different from the LS32 protocol and was reverse engineered by
+    snooping the USB communication of the vendor software. It consists of a sequence of fixed
+    header packets, one payload packet with the encoded bitmap, and two footer packets.
+    Currently, only static text / bitmap display is supported: the LS32 display options (speeds,
+    modes, blinks, ants, brightness) have no known encoding in this protocol and are ignored.
+    """
+
+    # Static packets of the custom protocol, as snooped from the vendor software
+    _header_packet_1 = tuple([0x4c, 0x43, 0x59, 0xf2] + [0x00] * 60)
+    _header_packet_2 = tuple([0x4c, 0x43, 0x59, 0xdd] + [0x00] * 60)
+    _header_packet_3 = (
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0xc8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    )
+    _header_packet_4 = tuple([0xff] * 64)
+    _header_packet_5 = tuple([0xff] * 64)
+    _footer_packet_1 = tuple([0x00] * 64)
+    _footer_packet_2 = tuple([0x4c, 0x43, 0x59, 0x99] + [0x00] * 60)
+
+    def create_buffers(self, msg_bitmaps, speeds, modes, blinks, ants, brightness):
+        pixel_map, width, height = self.get_pixel_map(msg_bitmaps)
+        bitmap_only_buf, _ = self.encode_custom_logic(pixel_map, width, height)
+
+        final_payload_buf = array('B', [0xff] * 8)
+        final_payload_buf.extend([0x00])
+        final_payload_buf.extend(bitmap_only_buf)
+
+        # The static packets are tuples, so they cannot be mutated by the write methods
+        # (which pad the buffers they write); hand out a fresh array for each of them.
+        return [array('B', packet) for packet in
+                (self._header_packet_1, self._header_packet_2, self._header_packet_3,
+                 self._header_packet_4, self._header_packet_5)] + \
+               [final_payload_buf] + \
+               [array('B', packet) for packet in (self._footer_packet_1, self._footer_packet_2)]
+
+    @staticmethod
+    def get_pixel_map(msg_bitmaps):
+        """Converts the original column-major byte buffer into a 2D pixel map."""
+        if not msg_bitmaps:
+            return [], 0, 0
+
+        total_width = sum(b[1] for b in msg_bitmaps) * 8
+        height = 11
+        pixel_map = [[0] * total_width for _ in range(height)]
+
+        current_x = 0
+        for buf, byte_cols in msg_bitmaps:
+            if len(buf) != byte_cols * height:
+                raise ValueError("The custom badge has %d rows, but the given bitmap has %d bytes "
+                                 "for %d byte-columns. Only 11x44 bitmaps are supported for this device."
+                                 % (height, len(buf), byte_cols))
+            for i in range(byte_cols):
+                for row in range(height):
+                    byte_val = buf[i * height + row]
+                    for bit in range(8):
+                        if (byte_val >> (7 - bit)) & 1:
+                            pixel_map[row][current_x + bit] = 1
+                current_x += 8
+        return pixel_map, total_width, height
+
+    @staticmethod
+    def encode_custom_logic(pixel_map, width, height):
+        """
+        Encodes a 2D pixel map into the custom byte sequence.
+        Processes the map in 2-column chunks, using 3 bytes of data for each chunk.
+        """
+        output_buf = array('B')
+        if width == 0 or height == 0:
+            return output_buf, 0
+
+        # Pad width to be a multiple of 2
+        if width % 2 != 0:
+            width += 1
+            for row in pixel_map:
+                row.append(0)
+
+        # Iterate through the pixel map in 2-column wide chunks
+        for col_chunk_start in range(0, width, 2):
+            # Each chunk is represented by 3 bytes (24 bits) of data
+            bits = []
+            # This chunk requires 22 bits for rendering (11 rows * 2 bits/row)
+            for row in range(height):
+                p1 = pixel_map[row][col_chunk_start]
+                # Handle edge case for the last column if width is odd
+                p2 = pixel_map[row][col_chunk_start + 1] if col_chunk_start + 1 < width else 0
+                bits.extend([p1, p2])
+
+            if len(bits) < 22:
+                bits.extend([0] * (22 - len(bits)))  # Pad if height < 11
+
+            # Pad with 2 discard bits to make it 24 bits (3 bytes)
+            bits.extend([0, 0])
+
+            # Convert the 24 bits into 3 bytes
+            for i in range(0, 24, 8):
+                byte_val = 0
+                for bit_index in range(8):
+                    if bits[i + bit_index] == 1:
+                        byte_val |= 1 << (7 - bit_index)
+                output_buf.append(byte_val)
+
+        # For the custom logic, the "length" in the header could mean the number
+        # of 2-column chunks, which is equivalent to the number of 3-byte chunks.
+        num_chunks = len(output_buf) // 3
+        return output_buf, num_chunks
+
+
 class WriteMethod:
     """Base class for a write method. That is a way to communicate with a device. Think of using different access
     libraries or interfaces for communication. Basically it implements the common parts of the functionalities
     'device detection' and 'write data' and defines te interfaces to the user and the concrete write method class.
+
+    A concrete write method is bound to the device(s) it serves by class attributes: vendor_id / product_id
+    select the USB device it looks for, and header_generator_class is the header generator of that device's
+    protocol. This way, different devices with different protocols get their own write methods (subclasses)
+    instead of decisions between devices being threaded through all the write methods.
     """
+    vendor_id = 0x0416
+    product_id = 0x5020
+    header_generator_class = Ls32HeaderGenerator
+    # The transport this write method uses ('libusb', 'hidapi', 'pyserial', ...). Subclasses for
+    # other devices on the same transport inherit it, so the method selection can reason about
+    # transports without knowing device specific method names.
+    transport = None
 
     def __init__(self):
         """Call it from your concrete class in your __init__ method with!
         """
         self.devices = {}
+        self.header_generator = self.header_generator_class()
 
     def __del__(self):
         self.close()
@@ -460,13 +697,13 @@ class WriteMethod:
         """
         raise NotImplementedError()
 
-    def open(self, device_id, vid, pid):
+    def open(self, device_id):
         """Opens the communication channel to the device, similar to open a file. The device id is one of the ids
         returned by get_available_devices() or 'auto', which selects just the first device in that dict.
         It is the common part of the opening process. The concrete open is done in _open() and is to be implemented
         individually.
         """
-        if self.is_ready() and self.is_device_present(vid, pid):
+        if self.is_ready() and self.is_device_present():
             actual_device_id = None
             if device_id == 'auto':
                 actual_device_id = sorted(self.devices.keys())[0]
@@ -484,22 +721,20 @@ class WriteMethod:
         """
         raise NotImplementedError()
 
-    def get_available_devices(self, vid, pid):
+    def get_available_devices(self):
         """Get all devices available via the concrete write method. It returns a dict with the device ids as keys
         and the device descriptions as values. These device ids are used with 'open()' to specify the wanted device.
         It the common part of this process. The concrete part is to be implemented in _get_available_devices()
         individually.
         """
         if self.is_ready() and not self.devices:
-            self.devices = self._get_available_devices(vid, pid)
+            self.devices = self._get_available_devices()
         return {did: data[0] for did, data in self.devices.items()}
 
-    def is_device_present(self, vid, pid):
+    def is_device_present(self):
         """Returns True if there is one or more devices available via the concrete write method, False otherwise.
         """
-        # Clear previous device cache if VID/PID changes
-        self.devices = {}
-        self.get_available_devices(vid, pid)
+        self.get_available_devices()
         return self.devices and len(self.devices) > 0
 
     def _open(self, device_id):
@@ -511,7 +746,7 @@ class WriteMethod:
         """
         raise NotImplementedError()
 
-    def _get_available_devices(self, vid, pid):
+    def _get_available_devices(self):
         """The concrete get-the-list action. This method is to be implemented in your concrete class. It shall
         Return a dict with one entry per available device. The key of an entry is the device id, like it will be
         used in open() / _open(). The value af an entry is a tuple with any data according to the needs of your
@@ -570,6 +805,7 @@ class WriteLibUsb(WriteMethod):
     """Write to a device using pyusb and libusb. The device ids consist of the bus number, the device number on that bus
     and the endpoint number.
     """
+    transport = 'libusb'
     _module_loaded = False
     try:
         import usb.core
@@ -606,8 +842,8 @@ class WriteLibUsb(WriteMethod):
         self.dev = None
         self.endpoint = None
 
-    def _get_available_devices(self, vid, pid):
-        devs = WriteLibUsb.usb.core.find(idVendor=vid, idProduct=pid, find_all=True)
+    def _get_available_devices(self):
+        devs = WriteLibUsb.usb.core.find(idVendor=self.vendor_id, idProduct=self.product_id, find_all=True)
         devices = {}
         for d in devs:
             try:
@@ -671,6 +907,9 @@ class WriteUsbHidApi(WriteMethod):
     """Write to a device connected to USB using pyhidapi and libhidapi. The device ids are simply the device paths as
     used by libhidapi.
     """
+    transport = 'hidapi'
+    # Delay in seconds between two 64 byte data chunks while writing. Some devices need this.
+    chunk_delay = 0
     _module_loaded = False
     try:
         import pyhidapi
@@ -708,8 +947,8 @@ class WriteUsbHidApi(WriteMethod):
         self.path = None
         self.dev = None
 
-    def _get_available_devices(self, vid, pid):
-        device_infos = WriteUsbHidApi.pyhidapi.hid_enumerate(vid, pid)
+    def _get_available_devices(self):
+        device_infos = WriteUsbHidApi.pyhidapi.hid_enumerate(self.vendor_id, self.product_id)
         devices = {}
         for d in device_infos:
             did = "%s" % (str(d.path.decode('ascii')),)
@@ -729,7 +968,8 @@ class WriteUsbHidApi(WriteMethod):
 
         print("Write using [%s] via hidapi" % (self.description,))
         for i in range(int(len(buf) / 64)):
-            time.sleep(0.1)
+            if self.chunk_delay:
+                time.sleep(self.chunk_delay)
             # sendbuf must contain "report ID" as first byte. "0" does the job here.
             sendbuf = array('B', [0])
             # Then, put the 64 payload bytes into the buffer
@@ -740,6 +980,7 @@ class WriteUsbHidApi(WriteMethod):
 class WriteSerial(WriteMethod):
     """Write to a device with the open-source firmware via the USB serial port using pyserial.
     """
+    transport = 'pyserial'
     _module_loaded = False
     try:
         import serial
@@ -777,7 +1018,7 @@ class WriteSerial(WriteMethod):
         self.path = None
         self.dev = None
 
-    def _get_available_devices(self, vid, pid):
+    def _get_available_devices(self):
         import serial.tools.list_ports
         ports = serial.tools.list_ports.comports()
 
@@ -802,99 +1043,53 @@ class WriteSerial(WriteMethod):
         self.dev.write(buf)
 
 
-class LedNameBadge:
-    _original_protocol_header_template = (
-        0x77, 0x61, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    )
-    # New static packet definitions for custom logic
-    _header_packet_1 = array('B', [0x4c, 0x43, 0x59, 0xf2] + [0x00] * 60)
-    _header_packet_2 = array('B', [0x4c, 0x43, 0x59, 0xdd] + [0x00] * 60)
-    _header_packet_3 = array('B', [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0xc8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-    )
-    _header_packet_4 = array('B', [0xff] * 64)
-    _header_packet_5 = array('B', [0xff] * 64)
-    _footer_packet_1 = array('B', [0x00] * 64)
-    _footer_packet_2 = array('B', [0x4c, 0x43, 0x59, 0x99] + [0x00] * 60)
+class WriteLibUsbCustom(WriteLibUsb):
+    """Write to a badge with the custom protocol (vendorID 0x204c, productID 0x4359) using pyusb and libusb.
+    It differs from WriteLibUsb only in the device it looks for and in the header generator bound to it.
+    """
+    vendor_id = 0x204c
+    product_id = 0x4359
+    header_generator_class = CustomHeaderGenerator
 
+    def get_name(self):
+        return 'libusb-custom'
+
+    def get_description(self):
+        return 'Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyusb package and libusb.'
+
+
+class WriteUsbHidApiCustom(WriteUsbHidApi):
+    """Write to a badge with the custom protocol (vendorID 0x204c, productID 0x4359) using pyhidapi and
+    libhidapi. It differs from WriteUsbHidApi only in the device it looks for, in the header generator
+    bound to it, and in the delay between the data chunks, which this device needs.
+    """
+    vendor_id = 0x204c
+    product_id = 0x4359
+    header_generator_class = CustomHeaderGenerator
+    chunk_delay = 0.1
+
+    def get_name(self):
+        return 'hidapi-custom'
+
+    def get_description(self):
+        return 'Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyhidapi package and libhidapi.'
+
+
+class LedNameBadge:
     @staticmethod
     def header(lengths, speeds, modes, blinks, ants, brightness=100, date=datetime.now()):
-        """Create a protocol header
-            * length, speeds, modes, blinks, ants are iterables with at least one element
-            * lengths[0] is the number of chars/byte-columns of the first text/bitmap, lengths[1] of the second,
-              and so on...
-            * len(length) should match the designated bitmap data
-            * speeds come in as 1..8, but will be decremented to 0..7, here.
-            * modes: 0..8
-            * blinks and ants: 0..1 or even False...True,
-            * brightness, if given, is any number, but it'll be limited to 25, 50, 75, 100 (percent), here
-            * date, if given, is a datetime object. It will be written in the header, but is not to be seen on the
-              devices screen.
+        """Create a protocol header for the original LS32 badge.
+        Kept for backwards compatibility: the implementation lives in Ls32HeaderGenerator,
+        which is bound to the LS32 write methods.
         """
-        try:
-            lengths_sum = sum(lengths)
-        except:
-            raise TypeError("Please give a list or tuple with at least one number: " + str(lengths))
-        if lengths_sum > (8192 - len(LedNameBadge._original_protocol_header_template)) / 11 + 1:
-            raise ValueError("The given lengths seem to be far too high: " + str(lengths))
-
-        ants = LedNameBadge._prepare_iterable(ants, 0, 1)
-        blinks = LedNameBadge._prepare_iterable(blinks, 0, 1)
-        speeds = LedNameBadge._prepare_iterable(speeds, 1, 8)
-        modes = LedNameBadge._prepare_iterable(modes, 0, 8)
-
-        speeds = [x - 1 for x in speeds]
-
-        h = list(LedNameBadge._original_protocol_header_template)
-
-        if brightness <= 25:
-            h[5] = 0x40
-        elif brightness <= 50:
-            h[5] = 0x20
-        elif brightness <= 75:
-            h[5] = 0x10
-        # else default 100% == 0x00
-
-        for i in range(8):
-            h[6] += blinks[i] << i
-            h[7] += ants[i] << i
-
-        for i in range(8):
-            h[8 + i] = 16 * speeds[i] + modes[i]
-
-        for i in range(len(lengths)):
-            h[17 + (2 * i) - 1] = lengths[i] // 256
-            h[17 + (2 * i)] = lengths[i] % 256
-
-        try:
-            h[38 + 0] = date.year % 100
-            h[38 + 1] = date.month
-            h[38 + 2] = date.day
-            h[38 + 3] = date.hour
-            h[38 + 4] = date.minute
-            h[38 + 5] = date.second
-        except:
-            raise TypeError("Please give a datetime object: " + str(date))
-
-        return h
+        return Ls32HeaderGenerator.header(lengths, speeds, modes, blinks, ants, brightness, date)
 
     @staticmethod
     def _prepare_iterable(iterable, min_, max_):
-        try:
-            iterable = [min(max(x, min_), max_) for x in iterable]
-            iterable = tuple(iterable) + (iterable[-1],) * (8 - len(iterable))  # repeat last element
-            return iterable
-        except:
-            raise TypeError("Please give a list or tuple with at least one number: " + str(iterable))
+        return Ls32HeaderGenerator._prepare_iterable(iterable, min_, max_)
 
     @staticmethod
-    def write(buf, method='auto', device_id='auto', vid=0x0416, pid=0x5020):
+    def write(buf, method='auto', device_id='auto'):
         """Write the given buffer to the given device.
             It has to begin with a protocol header as provided by header() and followed by the bitmap data.
             In short: the bitmap data is organized in bytes with 8 horizontal pixels per byte and 11 resp. 12
@@ -904,11 +1099,52 @@ class LedNameBadge:
             get_available_methods() and get_available_device_ids(). There are two special values each: 'list'
             will print the implemented / available write methods resp. the available devices, 'auto' (default) will
             choose an appropriate write method resp. the first device found.
+            This writes a buffer in the LS32 protocol, so it works only with the LS32 write methods.
+            For programming a device from message bitmaps in the protocol of the device actually found,
+            use write_bitmaps().
         """
-        write_method = LedNameBadge._find_write_method(method, device_id, vid, pid)
+        write_method = LedNameBadge._find_write_method(method, device_id)
         if write_method:
+            if not isinstance(write_method.header_generator, Ls32HeaderGenerator):
+                print("The write method '%s' serves a device with a different protocol and cannot "
+                      "write an LS32 buffer. Use write_bitmaps() to program that device." % (write_method.get_name(),))
+                write_method.close()
+                sys.exit(1)
             write_method.write(buf)
             write_method.close()
+
+    @staticmethod
+    def write_bitmaps(msg_bitmaps, speeds, modes, blinks, ants, brightness, method='auto', device_id='auto'):
+        """Write the given message bitmaps (as created by SimpleTextAndIcons.bitmap()) to the given device.
+            The header generator bound to the write method of the device found turns the bitmaps and the
+            display options into the buffers of that device's protocol, which are written in order, so
+            the caller does not have to distinguish between badge types.
+            The two optional parameters specify the write method and device, which shall be programmed,
+            with the same special values as in write().
+        """
+        write_method = LedNameBadge._find_write_method(method, device_id)
+        if write_method:
+            try:
+                try:
+                    buffers = write_method.header_generator.create_buffers(
+                        msg_bitmaps, speeds, modes, blinks, ants, brightness)
+                except (TypeError, ValueError) as e:
+                    print("Cannot create the data for this device: %s" % (e,))
+                    sys.exit(1)
+                # Concatenate the buffers, each padded to a multiple of 64 bytes, and write them
+                # in one single write: the transports send the data in 64 byte chunks anyway, so
+                # the bytes on the wire are the same, but the device is configured only once and
+                # an oversized sequence is rejected before anything is written at all.
+                buf = array('B')
+                for part in buffers:
+                    buf.extend(part)
+                    buf.extend((0,) * ((64 - len(part) % 64) % 64))
+                if len(buf) > 8192:
+                    print("Writing more than %d bytes damages the display! Nothing written." % (8192,))
+                    sys.exit(1)
+                write_method.write(buf)
+            finally:
+                write_method.close()
 
     @staticmethod
     def get_available_methods():
@@ -922,18 +1158,18 @@ class LedNameBadge:
         return {m.get_name(): (m.get_description(), m.is_ready()) for m in auto_order_methods}
 
     @staticmethod
-    def get_available_device_ids(method, vid, pid):
+    def get_available_device_ids(method):
         """Returns all devices available via the given write method as a dict. Each entry has the device id as the key
         and the device description as the value. The device id can be used as a parameter value for write().
         """
         auto_order_methods = LedNameBadge._get_auto_order_method_list()
         wanted_method = [m for m in auto_order_methods if m.get_name() == method]
         if wanted_method:
-            return wanted_method[0].get_available_devices(vid, pid)
+            return wanted_method[0].get_available_devices()
         return []
 
     @staticmethod
-    def _find_write_method(method, device_id, vid, pid):
+    def _find_write_method(method, device_id):
         """Here we try to concentrate all special cases, decisions and messages around the manual or automatic
         selection of write methods and device. This way it is a bit easier to extend or modify the different
         working run time environments (think of operating system, python version, installed libraries and python
@@ -943,14 +1179,22 @@ class LedNameBadge:
         libusb = [m for m in auto_order_methods if m.get_name() == 'libusb'][0]
 
         if method == 'list':
-            LedNameBadge._print_available_methods(auto_order_methods, vid, pid)
+            LedNameBadge._print_available_methods(auto_order_methods)
             sys.exit(0)
 
         if method not in [m.get_name() for m in auto_order_methods] and method != 'auto':
             print("Unknown write method '%s'." % (method,))
-            LedNameBadge._print_available_methods(auto_order_methods, vid, pid)
+            LedNameBadge._print_available_methods(auto_order_methods)
             sys.exit(1)
 
+        auto_selected = method == 'auto'
+        # The transport of the requested method ('auto' is narrowed to a transport below).
+        # Explicit device specific method names like 'libusb-custom' share the transport of
+        # their base method, so the platform and readiness checks below apply to them as well.
+        method_transport = method
+        for m in auto_order_methods:
+            if m.get_name() == method:
+                method_transport = m.transport
         if method == 'auto':
             if sys.version_info[0] < 3:
                 method = libusb.get_name()
@@ -975,39 +1219,65 @@ class LedNameBadge:
                     LedNameBadge._print_hidapi_install_hints(hidapi.get_name())
                     sys.exit(1)
 
-        if method == libusb.get_name():
+        if auto_selected and method != 'auto':
+            # 'auto' was narrowed to one transport above; the checks below and the
+            # method selection work with that transport.
+            method_transport = method
+
+        def sibling_name(transport):
+            """The name of the write method for the same device as the requested one,
+            but on the given transport (e.g. 'hidapi-custom' for 'libusb-custom')."""
+            requested = [m for m in auto_order_methods if m.get_name() == method]
+            if requested:
+                siblings = [m for m in auto_order_methods if m.transport == transport
+                            and (m.vendor_id, m.product_id) == (requested[0].vendor_id, requested[0].product_id)]
+                if siblings:
+                    return siblings[0].get_name()
+            return transport
+
+        if method_transport == libusb.transport:
             if sys.platform.startswith('darwin'):
-                print("For MacOs, please use method '%s' or 'auto'." % (hidapi.get_name(),))
+                print("For MacOs, please use method '%s' or 'auto'." % (sibling_name(hidapi.transport),))
                 print("Or help us implementing support for MacOs.")
                 sys.exit(1)
             elif not libusb.is_ready():
-                LedNameBadge._print_libusb_install_hints(libusb.get_name())
+                LedNameBadge._print_libusb_install_hints(method)
                 sys.exit(1)
 
-        if method == hidapi.get_name():
+        if method_transport == hidapi.transport:
             if sys.version_info[0] < 3:
-                print("Please use method '%s' or 'auto' with python-2.x" % (libusb.get_name(),))
+                print("Please use method '%s' or 'auto' with python-2.x" % (sibling_name(libusb.transport),))
                 print("because of https://github.com/jnweiger/led-badge-ls32/issues/9")
                 sys.exit(1)
             elif not hidapi.is_ready():
-                LedNameBadge._print_hidapi_install_hints(hidapi.get_name())
+                LedNameBadge._print_hidapi_install_hints(method)
                 sys.exit(1)
 
             if sys.platform.startswith('win') and hidapi.is_ready():
                 print("Method '%s' is not tested under Windows. If not working, please use '%s' or 'auto'" % (
-                    hidapi.get_name(), libusb.get_name()))
+                    method, sibling_name(libusb.transport)))
                 print("Or help us implementing support for Windows.")
                 # But it is not forbidden
 
+        if device_id == 'list':
+            eligible = [m for m in auto_order_methods
+                        if method == 'auto' or method == m.get_name()
+                        or (auto_selected and m.transport == method_transport)]
+            if auto_selected and method == 'auto':
+                # 'auto' was not narrowed to a transport: enumerating devices via libusb would
+                # detach the kernel driver of a connected badge, so for a pure listing only the
+                # hidapi methods are used, whose enumeration has no side effects.
+                eligible = [m for m in eligible if m.transport == 'hidapi']
+            for m in eligible:
+                LedNameBadge._print_available_devices(m)
+            sys.exit(0)
+
         first_method_found = None
         for m in auto_order_methods:
-            if method == 'auto' or method == m.get_name():
+            if method == 'auto' or method == m.get_name() or (auto_selected and m.transport == method_transport):
                 if not first_method_found:
                     first_method_found = m
-                if device_id == 'list':
-                    LedNameBadge._print_available_devices(m, vid, pid)
-                    sys.exit(0)
-                elif m.open(device_id, vid, pid):
+                if m.open(device_id):
                     return m
 
         device_id_str = ''
@@ -1016,8 +1286,13 @@ class LedNameBadge:
 
         print("The device is not available with write method '%s'%s." % (method, device_id_str))
         if first_method_found:
-            LedNameBadge._print_available_devices(first_method_found, vid, pid)
-        print("* Is a led tag device with vendorID %#04x and productID %#04x connected?" % (vid, pid))
+            LedNameBadge._print_available_devices(first_method_found)
+        device_ids = []
+        for m in auto_order_methods:
+            if (m.vendor_id, m.product_id) not in device_ids:
+                device_ids.append((m.vendor_id, m.product_id))
+        print("* Is a led tag device with %s connected?" % (" or ".join(
+            "vendorID 0x%04x and productID 0x%04x" % ids for ids in device_ids),))
         if device_id != 'auto':
             print("* Have you given the right device_id?")
             print("  Find the available device ids with option -D list")
@@ -1027,10 +1302,10 @@ class LedNameBadge:
 
     @staticmethod
     def _get_auto_order_method_list():
-        return [WriteUsbHidApi(), WriteLibUsb(), WriteSerial()]
+        return [WriteUsbHidApi(), WriteLibUsb(), WriteUsbHidApiCustom(), WriteLibUsbCustom(), WriteSerial()]
 
     @staticmethod
-    def _print_available_methods(methods, vid, pid):
+    def _print_available_methods(methods):
         print("Available write methods:")
         print("  'auto': selects the most appropriate of the available methods (default)")
         for m in methods:
@@ -1041,10 +1316,10 @@ class LedNameBadge:
         print("  '%s': %s" % (m.get_name(), m.get_description()))
 
     @staticmethod
-    def _print_available_devices(method_obj, vid, pid):
-        if method_obj.is_device_present(vid, pid):
+    def _print_available_devices(method_obj):
+        if method_obj.is_device_present():
             print("Known device ids with method '%s' are:" % (method_obj.get_name(),))
-            for did, descr in sorted(method_obj.get_available_devices(vid, pid).items()):
+            for did, descr in sorted(method_obj.get_available_devices().items()):
                 LedNameBadge._print_one_device(did, descr)
         else:
             print("No devices with method '%s' found." % (method_obj.get_name(),))
@@ -1108,103 +1383,6 @@ class LedNameBadge:
             print("* Best: add a udev rule like described in README.md.")
 
 
-def get_pixel_map(msg_bitmaps):
-    """Converts the original column-major byte buffer into a 2D pixel map."""
-    if not msg_bitmaps:
-        return [], 0, 0
-
-    total_width = sum(b[1] for b in msg_bitmaps) * 8
-    height = 11
-    pixel_map = [[0] * total_width for _ in range(height)]
-
-    current_x = 0
-    for buf, byte_cols in msg_bitmaps:
-        for i in range(byte_cols):
-            for row in range(height):
-                byte_val = buf[i * height + row]
-                for bit in range(8):
-                    if (byte_val >> (7 - bit)) & 1:
-                        pixel_map[row][current_x + bit] = 1
-            current_x += 8
-    return pixel_map, total_width, height
-
-
-def encode_custom_logic(pixel_map, width, height):
-    """
-    Encodes a 2D pixel map into the custom byte sequence.
-    Processes the map in 2-column chunks, using 3 bytes of data for each chunk.
-    """
-    output_buf = array('B')
-    if width == 0 or height == 0:
-        return output_buf, 0
-
-    # Pad width to be a multiple of 2
-    if width % 2 != 0:
-        width += 1
-        for row in pixel_map:
-            row.append(0)
-
-    # Iterate through the pixel map in 2-column wide chunks
-    for col_chunk_start in range(0, width, 2):
-        # Each chunk is represented by 3 bytes (24 bits) of data
-        bits = []
-        # This chunk requires 22 bits for rendering (11 rows * 2 bits/row)
-        for row in range(height):
-            p1 = pixel_map[row][col_chunk_start]
-            # Handle edge case for the last column if width is odd
-            p2 = pixel_map[row][col_chunk_start + 1] if col_chunk_start + 1 < width else 0
-            bits.extend([p1, p2])
-
-        if len(bits) < 22:
-            bits.extend([0] * (22 - len(bits)))  # Pad if height < 11
-
-        # Pad with 2 discard bits to make it 24 bits (3 bytes)
-        bits.extend([0, 0])
-
-        # Convert the 24 bits into 3 bytes
-        for i in range(0, 24, 8):
-            byte_val = 0
-            for bit_index in range(8):
-                if bits[i + bit_index] == 1:
-                    byte_val |= 1 << (7 - bit_index)
-            output_buf.append(byte_val)
-
-    # For the custom logic, the "length" in the header could mean the number
-    # of 2-column chunks, which is equivalent to the number of 3-byte chunks.
-    num_chunks = len(output_buf) // 3
-    return output_buf, num_chunks
-
-
-def find_supported_device(method_name):
-    """
-    Scans for known devices and returns the properties of the first one found.
-    """
-    KNOWN_DEVICES = [
-        {'vid': 0x204c, 'pid': 0x4359, 'logic': 'custom'},
-        {'vid': 0x0416, 'pid': 0x5020, 'logic': 'original'},
-    ]
-
-    possible_methods = LedNameBadge._get_auto_order_method_list()
-
-    # If the user forced a method, only check that one.
-    if method_name != 'auto':
-        possible_methods = [m for m in possible_methods if m.get_name() == method_name]
-
-    if not possible_methods:
-        return None, None, None
-
-    # Iterate through available communication methods
-    for method in possible_methods:
-        if method.is_ready():
-            # Check for each of our known devices
-            for device in KNOWN_DEVICES:
-                if method.is_device_present(device['vid'], device['pid']):
-                    print(f"Detected {device['logic']} device (VID={hex(device['vid'])}, PID={hex(device['pid'])}) via {method.get_name()} method.")
-                    return device['vid'], device['pid'], device['logic']
-
-    return None, None, None
-
-
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
                                      description='Upload messages or graphics to a 11x44 led badge via USB HID.\nVersion %s from https://github.com/jnweiger/led-badge-ls32\n -- see there for more examples and for updates.' % __version,
@@ -1265,16 +1443,6 @@ def main():
     """ % sys.argv[0])
     args = parser.parse_args()
 
-    # --- AUTOMATIC DEVICE DETECTION ---
-    vid, pid, logic_type = find_supported_device(args.method)
-
-    if logic_type is None:
-        print("\nError: Could not find any supported LED badge.")
-        print("  - Searched for Custom Device (VID=0x204c, PID=0x4359)")
-        print("  - Searched for Original Device (VID=0x0416, PID=0x5020)")
-        print("Please ensure one of these devices is connected and you have the correct permissions.")
-        sys.exit(1)
-
     creator = SimpleTextAndIcons()
 
     if args.preload:
@@ -1308,47 +1476,17 @@ def main():
         else:
             sys.exit("Parameter values are ambiguous. Please use -M only.")
 
-    # Open the device we found earlier
-    write_method = LedNameBadge._find_write_method(method, args.device_id, vid, pid)
-
-    # --- EXECUTE LOGIC BASED ON DETECTED DEVICE ---
-    if logic_type == 'custom':
-        pixel_map, width, height = get_pixel_map(msg_bitmaps)
-        bitmap_only_buf, _ = encode_custom_logic(pixel_map, width, height)
-        
-        payload_prefix = array('B', [0xff] * 8)
-        final_payload_buf = payload_prefix
-        final_payload_buf.extend([0x00])
-        final_payload_buf.extend(bitmap_only_buf)
-
-        if write_method:
-            print("Sending Custom Logic Packet Sequence...")
-            write_method.write(LedNameBadge._header_packet_1)
-            write_method.write(LedNameBadge._header_packet_2)
-            write_method.write(LedNameBadge._header_packet_3)
-            write_method.write(LedNameBadge._header_packet_4)
-            write_method.write(LedNameBadge._header_packet_5)
-            write_method.write(final_payload_buf)
-            write_method.write(LedNameBadge._footer_packet_1)
-            write_method.write(LedNameBadge._footer_packet_2)
-            write_method.close()
-
-    else: # Original Logic
-        lengths = [b[1] for b in msg_bitmaps]
-        speeds = split_to_ints(args.speed)
-        modes = split_to_ints(args.mode)
-        blinks = split_to_ints(args.blink)
-        ants = split_to_ints(args.ants)
-        brightness = int(args.brightness)
-
-        original_buf = array('B')
-        original_buf.extend(LedNameBadge.header(lengths, speeds, modes, blinks, ants, brightness))
-        for msg_buf in [b[0] for b in msg_bitmaps]:
-            original_buf.extend(msg_buf)
-
-        if write_method:
-            write_method.write(original_buf)
-            write_method.close()
+    # The header generator bound to the write method of the device found knows its protocol,
+    # so we do not have to distinguish between badge types here.
+    LedNameBadge.write_bitmaps(
+        msg_bitmaps,
+        split_to_ints(args.speed),
+        split_to_ints(args.mode),
+        split_to_ints(args.blink),
+        split_to_ints(args.ants),
+        int(args.brightness),
+        method,
+        args.device_id)
 
 
 def split_to_ints(list_str):

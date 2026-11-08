@@ -7,11 +7,16 @@ import abstract_write_method_test
 class Test(abstract_write_method_test.AbstractWriteMethodTest):
     def test_get_methods(self):
         methods, output = self.call_info_methods()
+        # The readiness of the pyserial method depends on the test environment
+        import importlib.util
+        pyserial_ready = importlib.util.find_spec('serial') is not None
         self.assertDictEqual({
             'hidapi': ('Program a device connected via USB using the pyhidapi package and libhidapi.', True),
             'libusb': ('Program a device connected via USB using the pyusb package and libusb.', True),
-            'pyserial': ('Program a device with the open-source firmware, connected via USB, using the pyserial package.', False)
-        }, methods)
+            'pyserial': ('Program a device with the open-source firmware, connected via USB, using the pyserial package.', pyserial_ready),
+            'hidapi-custom': ('Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyhidapi package and libhidapi.', True),
+            'libusb-custom': ('Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyusb package and libusb.', True)},
+            methods)
 
     def test_get_device_ids(self):
         device_ids, output = self.call_info_ids('libusb')
@@ -20,6 +25,16 @@ class Test(abstract_write_method_test.AbstractWriteMethodTest):
             device_ids)
 
         device_ids, output = self.call_info_ids('hidapi')
+        self.assertDictEqual({
+            '3-4:5-6': 'HidApi Test Manufacturer - HidApi Test Product (if=0)'},
+            device_ids)
+
+        device_ids, output = self.call_info_ids('libusb-custom')
+        self.assertDictEqual({
+            '3:4:2': 'LibUsb Test Manufacturer - LibUsb Test Product (bus=3 dev=4 endpoint=2)'},
+            device_ids)
+
+        device_ids, output = self.call_info_ids('hidapi-custom')
         self.assertDictEqual({
             '3-4:5-6': 'HidApi Test Manufacturer - HidApi Test Product (if=0)'},
             device_ids)
@@ -49,7 +64,7 @@ class Test(abstract_write_method_test.AbstractWriteMethodTest):
     def call_info_ids(self, method):
         self.print_test_conditions(True, True, True, '-', '-')
         method_obj, output, _ = self.prepare_modules(True, True, True,
-                                                     lambda m: m.get_available_device_ids(method,vid=0x0416, pid=0x5020))
+                                                     lambda m: m.get_available_device_ids(method))
         return method_obj, output
 
     def call_write(self, method):

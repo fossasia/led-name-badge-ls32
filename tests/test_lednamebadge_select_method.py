@@ -157,7 +157,7 @@ class Test(abstract_write_method_test.AbstractWriteMethodTest):
     def call_find(self, pyusb_available, pyhidapi_available, device_available, method, device_id):
         self.print_test_conditions(pyusb_available, pyhidapi_available, device_available, method, device_id)
         method_obj, output, _ = self.prepare_modules(pyusb_available, pyhidapi_available, device_available,
-                                                  lambda m: m._find_write_method(method, device_id, vid=0x0416, pid=0x5020))
+                                                  lambda m: m._find_write_method(method, device_id))
         self.assertEqual(pyusb_available, 'usb.core detected' in output)
         self.assertEqual(pyhidapi_available, 'pyhidapi detected' in output)
         return method_obj, output
