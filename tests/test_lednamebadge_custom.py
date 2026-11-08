@@ -105,9 +105,11 @@ class Test(TestCase):
             CustomHeaderGenerator().create_buffers(huge, (4,), (0,), (0,), (0,), 100)
 
     def test_create_buffers_accepts_iterables(self):
-        # msg_bitmaps may be any iterable, e.g. a generator; it is traversed more than once
-        buffers = CustomHeaderGenerator().create_buffers(iter(self.blank), (4,), (0,), (0,), (0,), 100)
+        # msg_bitmaps may be any iterable, e.g. a generator; it is traversed more than once,
+        # so assert the complete payload, not just the buffer count
+        buffers = CustomHeaderGenerator().create_buffers(iter(self.full), (4,), (0,), (0,), (0,), 100)
         self.assertEqual(8, len(buffers))
+        self.assertEqual([0xff] * 8 + [0x00] + [0xff, 0xff, 0xfc] * 4, list(buffers[5]))
         buffers = Ls32HeaderGenerator().create_buffers(iter(self.full), (4,), (0,), (0,), (0,), 100)
         self.assertEqual(1, len(buffers))
         self.assertEqual(list(self.full[0][0]), list(buffers[0][64:]))
