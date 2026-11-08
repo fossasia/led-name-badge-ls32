@@ -113,6 +113,10 @@ class Test(TestCase):
         buffers = Ls32HeaderGenerator().create_buffers(iter(self.full), (4,), (0,), (0,), (0,), 100)
         self.assertEqual(1, len(buffers))
         self.assertEqual(list(self.full[0][0]), list(buffers[0][64:]))
+        # A multi-message iterator must be rejected just like a multi-message list
+        with self.assertRaises(ValueError):
+            CustomHeaderGenerator().create_buffers(iter([self.full[0], self.blank[0]]),
+                                                   (4,), (0,), (0,), (0,), 100)
 
     def test_custom_rejects_12row_bitmaps(self):
         bitmap12 = [(array('B', [0x00] * 12), 1)]  # one byte-column of a 12x48 badge
