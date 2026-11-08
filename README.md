@@ -23,6 +23,21 @@ In both configurations, the badge identifies itself on the USB as
     Mfr=1, Product=2, SerialNumber=0
     LSicroelectronics LS32 Custm HID
 
+There is also a different badge (a blue one, with a GD32F150 controller) which
+identifies itself on the USB as
+
+    idVendor=204c, idProduct=4359
+
+It speaks a completely different protocol, which was reverse engineered from
+the USB communication of its vendor software. This program detects it
+automatically, just like the LS32 badge above; its write methods are
+'hidapi-custom' and 'libusb-custom' (see `-M list`). Currently, only static
+text and bitmaps are supported for this badge, and only a single message at
+a time — its protocol has no message slots, so several messages cannot be
+combined into one upload. Scroll speeds, animation
+modes, blinking, animated borders and brightness have no known encoding in
+its protocol yet. The udev rule file also covers this badge.
+
 ## Warning
 
 There are many different versions of LED Badges on the market.

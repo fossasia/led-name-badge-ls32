@@ -9,3 +9,7 @@ SUBSYSTEM=="usb",  ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5020", MODE="0666
 # FIXME: the following line is not sufficient for pyhidapi.
 KERNEL=="hidraw*", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5020", ATTRS{busnum}=="1", MODE="0666"
 
+# The badge with the GD32F150 controller and its custom protocol
+SUBSYSTEM=="usb",  ATTRS{idVendor}=="204c", ATTRS{idProduct}=="4359", MODE="0666"
+KERNEL=="hidraw*", ATTRS{idVendor}=="204c", ATTRS{idProduct}=="4359", MODE="0666"
+
