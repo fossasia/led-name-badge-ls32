@@ -1,7 +1,8 @@
 import datetime
+import sys
 from array import array
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import abstract_write_method_test
 from lednamebadge import LedNameBadge, Ls32HeaderGenerator, CustomHeaderGenerator
@@ -80,6 +81,37 @@ class Test(TestCase):
         self.assertEqual(0, WriteUsbHidApi.chunk_delay)
         self.assertEqual(0.1, WriteUsbHidApiCustom.chunk_delay)
 
+    def test_custom_create_buffers_asymmetric(self):
+        # A single set pixel must land at exactly one place of the encoded payload;
+        # symmetric test bitmaps (blank / full) cannot detect mirrored or flipped encoding.
+        # Pixel at row 0, column 0: first byte of the first 2-column chunk.
+        bitmap = array('B', [0x00] * 11)
+        bitmap[0] = 0x80
+        buffers = CustomHeaderGenerator().create_buffers([(bitmap, 1)], (4,), (0,), (0,), (0,), 100)
+        self.assertEqual([0xff] * 8 + [0x00] + [0x80, 0x00, 0x00] + [0x00] * 9, list(buffers[5]))
+        # Pixel at row 10, column 7: last bit of the last 2-column chunk.
+        bitmap = array('B', [0x00] * 11)
+        bitmap[10] = 0x01
+        buffers = CustomHeaderGenerator().create_buffers([(bitmap, 1)], (4,), (0,), (0,), (0,), 100)
+        self.assertEqual([0xff] * 8 + [0x00] + [0x00] * 9 + [0x00, 0x00, 0x04], list(buffers[5]))
+
+    def test_custom_rejects_multiple_messages(self):
+        with self.assertRaises(ValueError):
+            CustomHeaderGenerator().create_buffers([self.blank[0], self.full[0]], (4,), (0,), (0,), (0,), 100)
+
+    def test_custom_rejects_oversized_bitmap(self):
+        huge = [(array('B', bytes(11 * 1000)), 1000)]  # 1000 byte-columns, far beyond the 8192 bytes limit
+        with self.assertRaises(ValueError):
+            CustomHeaderGenerator().create_buffers(huge, (4,), (0,), (0,), (0,), 100)
+
+    def test_create_buffers_accepts_iterables(self):
+        # msg_bitmaps may be any iterable, e.g. a generator; it is traversed more than once
+        buffers = CustomHeaderGenerator().create_buffers(iter(self.blank), (4,), (0,), (0,), (0,), 100)
+        self.assertEqual(8, len(buffers))
+        buffers = Ls32HeaderGenerator().create_buffers(iter(self.full), (4,), (0,), (0,), (0,), 100)
+        self.assertEqual(1, len(buffers))
+        self.assertEqual(list(self.full[0][0]), list(buffers[0][64:]))
+
     def test_custom_rejects_12row_bitmaps(self):
         bitmap12 = [(array('B', [0x00] * 12), 1)]  # one byte-column of a 12x48 badge
         with self.assertRaises(ValueError):
@@ -148,6 +180,68 @@ class TestAutoNarrowing(abstract_write_method_test.AbstractWriteMethodTest):
         self.assertIn("Known device ids with method 'hidapi-custom' are:", output)
         self.assertNotIn("Known device ids with method 'libusb' are:", output)
         self.assertNotIn("Known device ids with method 'libusb-custom' are:", output)
+
+
+class TestCustomAutoSelection(TestCase):
+    """Auto selection with transports that only enumerate the custom badge (VID/PID aware mocks):
+    after the platform narrowing of 'auto', the custom write method of that transport must be found."""
+
+    def _modules(self):
+        hid_dev = MagicMock()
+        hid_dev.path = b'3-4:5-6'
+        hid_dev.manufacturer_string = 'CustomMfr'
+        hid_dev.product_string = 'CustomBadge'
+        hid_dev.interface_number = 0
+        hid = MagicMock()
+        hid.hid_enumerate.side_effect = lambda vid, pid: [hid_dev] if (vid, pid) == (0x204c, 0x4359) else []
+        hid.hid_open_path.return_value = 4242
+
+        usb_dev = MagicMock()
+        usb_dev.manufacturer = 'CustomMfr'
+        usb_dev.product = 'CustomBadge'
+        usb_dev.bus = 3
+        usb_dev.address = 4
+        usb_dev.is_kernel_driver_active.return_value = False
+        ep = MagicMock()
+        ep.bEndpointAddress = 2
+        usb = MagicMock()
+        usb.core.USBError = Exception
+        usb.core.find.side_effect = lambda idVendor, idProduct, find_all=True: \
+            [usb_dev] if (idVendor, idProduct) == (0x204c, 0x4359) else []
+        usb.util.find_descriptor.return_value = [ep]
+        return {'pyhidapi': hid, 'usb': usb, 'usb.core': usb.core, 'usb.util': usb.util}
+
+    def _find(self, platform, *args):
+        with patch('sys.platform', new=platform):
+            with patch.dict('sys.modules', self._modules()):
+                sys.modules.pop('lednamebadge', None)
+                import lednamebadge
+                return lednamebadge.LedNameBadge._find_write_method(*args)
+
+    def test_auto_darwin_selects_hidapi_custom(self):
+        method = self._find('darwin', 'auto', 'auto')
+        self.assertEqual('hidapi-custom', method.get_name())
+
+    def test_auto_windows_selects_libusb_custom(self):
+        method = self._find('windows', 'auto', 'auto')
+        self.assertEqual('libusb-custom', method.get_name())
+
+    def test_auto_filtered_by_protocol(self):
+        # Asking for an LS32 device must not open the custom badge, and vice versa.
+        # The generator classes must come from the same (mocked) module import.
+        with patch('sys.platform', new='darwin'):
+            with patch.dict('sys.modules', self._modules()):
+                sys.modules.pop('lednamebadge', None)
+                import lednamebadge
+                with self.assertRaises(SystemExit):
+                    lednamebadge.LedNameBadge._find_write_method('auto', 'auto',
+                                                                 lednamebadge.Ls32HeaderGenerator)
+                method = lednamebadge.LedNameBadge._find_write_method('auto', 'auto',
+                                                                      lednamebadge.CustomHeaderGenerator)
+                self.assertEqual('hidapi-custom', method.get_name())
+                # End to end: the raw-buffer write() in auto mode must not use the custom badge
+                with self.assertRaises(SystemExit):
+                    lednamebadge.LedNameBadge.write(array('B', [1, 2, 3]))
 
 
 class TestDeviceIds(abstract_write_method_test.AbstractWriteMethodTest):

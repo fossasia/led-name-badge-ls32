@@ -1,19 +1,20 @@
 import sys
 from array import array
+from unittest.mock import patch
 
 import abstract_write_method_test
 
 
 class Test(abstract_write_method_test.AbstractWriteMethodTest):
     def test_get_methods(self):
-        methods, output = self.call_info_methods()
-        # The readiness of the pyserial method depends on the test environment
-        import importlib.util
-        pyserial_ready = importlib.util.find_spec('serial') is not None
+        # Make the pyserial method deterministically not ready in this test,
+        # independent of the test environment: 'serial' cannot be imported.
+        with patch.dict('sys.modules', {'serial': None}):
+            methods, output = self.call_info_methods()
         self.assertDictEqual({
             'hidapi': ('Program a device connected via USB using the pyhidapi package and libhidapi.', True),
             'libusb': ('Program a device connected via USB using the pyusb package and libusb.', True),
-            'pyserial': ('Program a device with the open-source firmware, connected via USB, using the pyserial package.', pyserial_ready),
+            'pyserial': ('Program a device with the open-source firmware, connected via USB, using the pyserial package.', False),
             'hidapi-custom': ('Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyhidapi package and libhidapi.', True),
             'libusb-custom': ('Program a badge with the custom protocol (vendorID 0x204c, productID 0x4359) connected via USB using the pyusb package and libusb.', True)},
             methods)

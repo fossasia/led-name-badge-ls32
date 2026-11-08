@@ -539,6 +539,7 @@ class Ls32HeaderGenerator(HeaderGenerator):
             raise TypeError("Please give a list or tuple with at least one number: " + str(iterable))
 
     def create_buffers(self, msg_bitmaps, speeds, modes, blinks, ants, brightness):
+        msg_bitmaps = list(msg_bitmaps)
         buf = array('B')
         buf.extend(self.header([b[1] for b in msg_bitmaps], speeds, modes, blinks, ants, brightness))
         for msg_bitmap in msg_bitmaps:
@@ -570,6 +571,23 @@ class CustomHeaderGenerator(HeaderGenerator):
     _footer_packet_2 = tuple([0x4c, 0x43, 0x59, 0x99] + [0x00] * 60)
 
     def create_buffers(self, msg_bitmaps, speeds, modes, blinks, ants, brightness):
+        msg_bitmaps = list(msg_bitmaps)
+        # This protocol has a single static image: there are no message slots, so the
+        # message boundaries (and their individual display options) would be lost.
+        if len(msg_bitmaps) > 1:
+            raise ValueError("Only one message is supported for the custom badge. "
+                             "Please pass your text as a single message (one argument).")
+        # Validate the size before expanding the bitmap into a pixel map: the padded
+        # total of the packet sequence (7 static packets of 64 bytes, the payload with
+        # its 9 prefix bytes and 3 bytes per 2 pixel columns) must fit into 8192 bytes,
+        # which is the limit the write methods enforce for a single write.
+        if msg_bitmaps:
+            total_width = msg_bitmaps[0][1] * 8
+            payload_length = 9 + (total_width // 2) * 3
+            total_length = 7 * 64 + payload_length + (64 - payload_length % 64) % 64
+            if total_length > 8192:
+                raise ValueError("The given bitmap is far too large for the custom badge: "
+                                 "it would need %d bytes, more than the 8192 bytes limit." % (total_length,))
         pixel_map, width, height = self.get_pixel_map(msg_bitmaps)
         bitmap_only_buf, _ = self.encode_custom_logic(pixel_map, width, height)
 
@@ -588,19 +606,21 @@ class CustomHeaderGenerator(HeaderGenerator):
     @staticmethod
     def get_pixel_map(msg_bitmaps):
         """Converts the original column-major byte buffer into a 2D pixel map."""
+        msg_bitmaps = list(msg_bitmaps)
         if not msg_bitmaps:
             return [], 0, 0
 
         total_width = sum(b[1] for b in msg_bitmaps) * 8
         height = 11
-        pixel_map = [[0] * total_width for _ in range(height)]
-
-        current_x = 0
         for buf, byte_cols in msg_bitmaps:
             if len(buf) != byte_cols * height:
                 raise ValueError("The custom badge has %d rows, but the given bitmap has %d bytes "
                                  "for %d byte-columns. Only 11x44 bitmaps are supported for this device."
                                  % (height, len(buf), byte_cols))
+        pixel_map = [[0] * total_width for _ in range(height)]
+
+        current_x = 0
+        for buf, byte_cols in msg_bitmaps:
             for i in range(byte_cols):
                 for row in range(height):
                     byte_val = buf[i * height + row]
@@ -1103,7 +1123,11 @@ class LedNameBadge:
             For programming a device from message bitmaps in the protocol of the device actually found,
             use write_bitmaps().
         """
-        write_method = LedNameBadge._find_write_method(method, device_id)
+        # With 'auto', only write methods bound to the LS32 protocol are considered, so a
+        # connected badge with a different protocol does not shadow a compatible device.
+        # An explicitly given method is used as-is (and refused below, if incompatible).
+        write_method = LedNameBadge._find_write_method(
+            method, device_id, Ls32HeaderGenerator if method == 'auto' else None)
         if write_method:
             if not isinstance(write_method.header_generator, Ls32HeaderGenerator):
                 print("The write method '%s' serves a device with a different protocol and cannot "
@@ -1169,7 +1193,7 @@ class LedNameBadge:
         return []
 
     @staticmethod
-    def _find_write_method(method, device_id):
+    def _find_write_method(method, device_id, header_generator_class=None):
         """Here we try to concentrate all special cases, decisions and messages around the manual or automatic
         selection of write methods and device. This way it is a bit easier to extend or modify the different
         working run time environments (think of operating system, python version, installed libraries and python
@@ -1261,8 +1285,10 @@ class LedNameBadge:
 
         if device_id == 'list':
             eligible = [m for m in auto_order_methods
-                        if method == 'auto' or method == m.get_name()
-                        or (auto_selected and m.transport == method_transport)]
+                        if (method == 'auto' or method == m.get_name()
+                            or (auto_selected and m.transport == method_transport))
+                        and (header_generator_class is None
+                             or m.header_generator_class == header_generator_class)]
             if auto_selected and method == 'auto':
                 # 'auto' was not narrowed to a transport: enumerating devices via libusb would
                 # detach the kernel driver of a connected badge, so for a pure listing only the
@@ -1270,11 +1296,19 @@ class LedNameBadge:
                 eligible = [m for m in eligible if m.transport == 'hidapi']
             for m in eligible:
                 LedNameBadge._print_available_devices(m)
+            if auto_selected and method == 'auto' and not any(m.is_ready() for m in eligible):
+                suggestions = ["'-M %s -D list'" % m.get_name() for m in auto_order_methods
+                               if m.transport == 'libusb'
+                               and (header_generator_class is None
+                                    or m.header_generator_class == header_generator_class)]
+                print("The methods above are not available, because their python package could not be loaded.")
+                print("To list the devices via libusb instead, use %s." % (" or ".join(suggestions),))
             sys.exit(0)
 
         first_method_found = None
         for m in auto_order_methods:
-            if method == 'auto' or method == m.get_name() or (auto_selected and m.transport == method_transport):
+            if (method == 'auto' or method == m.get_name() or (auto_selected and m.transport == method_transport)) \
+                    and (header_generator_class is None or m.header_generator_class == header_generator_class):
                 if not first_method_found:
                     first_method_found = m
                 if m.open(device_id):
@@ -1289,6 +1323,8 @@ class LedNameBadge:
             LedNameBadge._print_available_devices(first_method_found)
         device_ids = []
         for m in auto_order_methods:
+            if header_generator_class is not None and m.header_generator_class != header_generator_class:
+                continue
             if (m.vendor_id, m.product_id) not in device_ids:
                 device_ids.append((m.vendor_id, m.product_id))
         print("* Is a led tag device with %s connected?" % (" or ".join(

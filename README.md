@@ -32,7 +32,9 @@ It speaks a completely different protocol, which was reverse engineered from
 the USB communication of its vendor software. This program detects it
 automatically, just like the LS32 badge above; its write methods are
 'hidapi-custom' and 'libusb-custom' (see `-M list`). Currently, only static
-text and bitmaps are supported for this badge — scroll speeds, animation
+text and bitmaps are supported for this badge, and only a single message at
+a time — its protocol has no message slots, so several messages cannot be
+combined into one upload. Scroll speeds, animation
 modes, blinking, animated borders and brightness have no known encoding in
 its protocol yet. The udev rule file also covers this badge.
 
